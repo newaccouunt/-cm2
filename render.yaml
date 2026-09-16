@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: icmr-search
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: HF_TOKEN
+        sync: false
+      - key: ICMR_HF_REPO
+        value: bronx-ultra/icrm-hitek-full-db-mixed-bucket
+    healthCheckPath: /health
