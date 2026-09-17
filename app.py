@@ -8,25 +8,21 @@ from typing import Any
 import duckdb
 import gradio as gr
 import httpx
+from huggingface_hub import HfFileSystem   # ✅ bucket access ke liye
 from fastapi import FastAPI, HTTPException, Query, Response
 from pydantic import BaseModel
 
 # ── Config ──────────────────────────────────────────────────────────────────
 BASE = os.path.dirname(os.path.abspath(__file__))
 
-# 🔑 APNA HF TOKEN YAHAN DAALO (या Render env var से सेट करो)
-HF_TOKEN = os.environ.get("HF_TOKEN", "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")
+# 🔑 APNA HF TOKEN YAHAN DAALO (ya Render env var se set karo)
+HF_TOKEN = os.environ.get("HF_TOKEN", "hf_PASTE_YOUR_TOKEN_HERE")
 
-# ✅ BUCKET का सही base URL
-HF_BUCKET_BASE = os.environ.get(
-    "ICMR_HF_BUCKET_BASE",
-    "https://huggingface.co/buckets/bronx-ultra/icrm-hitek-full-db-mixed-bucket/resolve",
-).rstrip("/")
+# ✅ Bucket details
+HF_BUCKET_ID = "bronx-ultra/icrm-hitek-full-db-mixed-bucket"
+HF_BUCKET_BASE = f"https://huggingface.co/buckets/{HF_BUCKET_ID}/resolve"
+HF_BUCKET_DUCKDB = f"hf://buckets/{HF_BUCKET_ID}"   # HfFileSystem ke saath kaam karega
 
-# ✅ DuckDB के लिए bucket path (datasets नहीं, buckets)
-HF_BUCKET_DUCKDB = "hf://buckets/bronx-ultra/icrm-hitek-full-db-mixed-bucket"
-
-INDEX_SOURCE = os.environ.get("ICMR_INDEX_SOURCE", "remote").lower()
 PARALLELISM = int(os.environ.get("ICMR_PARALLEL", "2"))
 THREADS_PER_CONN = int(os.environ.get("ICMR_THREADS_PER_CONN", "2"))
 DUPLICATE_CAP = 2
@@ -40,7 +36,7 @@ NUMBER_FIELDS = ["phoneNumber", "aadharNumber", "otherNumber"]
 IDX_PHONE = "idx_phone"
 IDX_AADHAR = "idx_aadhar"
 
-# ✅ Bucket के लिए DuckDB paths
+# ✅ SAARI 7 files use ho rahi hain — 100% index coverage
 REMOTE_INDEXES = {
     "phone": [f"{HF_BUCKET_DUCKDB}/{IDX_PHONE}.{i}.parquet" for i in range(7)],
     "aadhar": [f"{HF_BUCKET_DUCKDB}/{IDX_AADHAR}.{i}.parquet" for i in range(7)],
@@ -58,17 +54,17 @@ def _idx_ready(kind: str) -> bool:
 
 
 def _new_conn() -> duckdb.DuckDBPyConnection:
+    """Naya DuckDB connection banao — HfFileSystem register karke."""
     con = duckdb.connect()
     con.execute("SET home_directory='/tmp'")
     con.execute("SET extension_directory='/tmp/duckdb_extensions'")
     con.execute("INSTALL parquet; LOAD parquet;")
     con.execute("INSTALL httpfs; LOAD httpfs;")
 
-    # 🔑 HF Token — private/gated bucket के लिए ज़रूरी
-    if HF_TOKEN and HF_TOKEN.startswith("hf_"):
-        con.execute(
-            f"CREATE OR REPLACE SECRET hf (TYPE huggingface, TOKEN '{HF_TOKEN}')"
-        )
+    # ✅ HfFileSystem register karo — BUCKET access ke liye ZAROORI
+    #    Token ke saath, taaki private/gated bucket bhi kaam kare
+    fs = HfFileSystem(token=HF_TOKEN if HF_TOKEN.startswith("hf_") else None)
+    con.register_filesystem(fs)
 
     for kind, urls in REMOTE_INDEXES.items():
         view = f"people_{kind}"
@@ -182,16 +178,19 @@ def _unified_search(q: str, limit: int = 10) -> dict:
 
     all_rows, searched = [], []
 
+    # ✅ Pehle PHONE index (saari 7 files) — fast
     if _idx_ready("phone"):
         r = _run_field_search("phoneNumber", q, "exact", limit)
         all_rows.extend(r["results"])
         searched.append("phoneNumber")
 
+    # ✅ Agar phone mein nahi mila toh AADHAR index (saari 7 files)
     if not all_rows and _idx_ready("aadhar"):
         r = _run_field_search("aadharNumber", q, "exact", limit)
         all_rows.extend(r["results"])
         searched.append("aadharNumber")
 
+    # Enrich — connected numbers se extra records
     if all_rows:
         connected_searches = set()
         for row in all_rows[:3]:
@@ -227,11 +226,11 @@ def root():
     return {
         "app": "ICMR + HITEK Search API",
         "records": 2_504_793_870,
+        "bucket": HF_BUCKET_ID,
         "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar")},
-        "index_source": INDEX_SOURCE,
         "columns": SEARCH_FIELDS,
         "docs": "/docs",
-        "developer": "@kzr0x | channel @api_wallah",
+        "developer": "@BRONX_ULTRA | credit @BRONX_ULTRA",
     }
 
 
@@ -239,27 +238,28 @@ def root():
 def health():
     return {
         "status": "ok",
-        "raw_database_required": False,
+        "bucket": HF_BUCKET_ID,
         "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar")},
-        "index_source": INDEX_SOURCE,
     }
 
 
 @fastapi_app.get("/debug")
 def debug():
-    """✅ PEHLE YE CHALAO — dataset aur token check karne ke liye."""
+    """✅ PEHLE YE CHALAO — bucket aur token check karne ke liye."""
     try:
         con = _get_conn()
+        # Phone index ki pehli file se sample
         sample = con.execute(
             f"SELECT * FROM read_parquet('{REMOTE_INDEXES['phone'][0]}', union_by_name=true) LIMIT 1"
         ).fetchdf()
+        # Saari phone files count karo
         files = con.execute(
             f"SELECT COUNT(*) FROM glob('{HF_BUCKET_DUCKDB}/{IDX_PHONE}.*.parquet')"
         ).fetchone()[0]
         con.close()
         return {
             "status": "connected",
-            "bucket": HF_BUCKET_BASE,
+            "bucket": HF_BUCKET_ID,
             "duckdb_path": HF_BUCKET_DUCKDB,
             "token_loaded": bool(HF_TOKEN and HF_TOKEN.startswith("hf_")),
             "phone_files_found": files,
@@ -268,7 +268,7 @@ def debug():
     except Exception as e:
         return {
             "status": "error",
-            "bucket": HF_BUCKET_BASE,
+            "bucket": HF_BUCKET_ID,
             "duckdb_path": HF_BUCKET_DUCKDB,
             "token_loaded": bool(HF_TOKEN and HF_TOKEN.startswith("hf_")),
             "error": str(e),
@@ -381,7 +381,7 @@ def search_ui(query: str, limit: int) -> str:
     searched = ", ".join(data.get("searched_fields", []))
 
     if not results:
-        return f"🔍 **Query:** `{q}`\n**Searched:** {searched}\n\n❌ **No data found** for this number."
+        return f"🔍 **Query:** `{q}`\n**Searched:** {searched}\n\n❌ **No data found**."
 
     header = (
         f"🔍 **Query:** `{q}`  |  **Found:** {count} results  |  "
@@ -444,14 +444,14 @@ def build_ui():
 - `GET /search?q=<number>` — Phone/Aadhaar search
 - `GET /search?mobile=<number>` — Phone search (alias)
 - `GET /health` — Health check
-- `GET /debug` — Dataset connection test
+- `GET /debug` — Bucket connection test
 - `GET /docs` — Swagger UI
             """)
 
         gr.Markdown(
             "---\n"
             "<div class='footer'>"
-            "👨‍💻 **Developer:** @BRONX_ULTRA  |  📢 **credit:** @BRONX_ULTRA"
+            "👨‍💻 **Developer:** @kzr0x  |  📢 **Channel:** @api_wallah"
             "</div>",
             elem_classes="footer",
         )
