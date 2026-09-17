@@ -1,26 +1,28 @@
 import asyncio
 import json
 import os
-import threading
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-import duckdb
 import httpx
-from huggingface_hub import HfFileSystem
+import pandas as pd
+import pyarrow.parquet as pq
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import HTMLResponse
+from huggingface_hub import hf_hub_download
 from pydantic import BaseModel
 
-# ── Config (sab env var se) ─────────────────────────────────────────────────
+# ── Config ──────────────────────────────────────────────────────────────────
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
-HF_BUCKET_ID = os.environ.get(
-    "HF_BUCKET_ID", "bronx-ultra/icrm-hitek-full-db-mixed-bucket"
-)
-HF_BUCKET_DUCKDB = f"hf://buckets/{HF_BUCKET_ID}"
 
-PARALLELISM = int(os.environ.get("ICMR_PARALLEL", "2"))
-THREADS_PER_CONN = int(os.environ.get("ICMR_THREADS_PER_CONN", "2"))
+HF_BUCKET_REPO = os.environ.get(
+    "HF_BUCKET_REPO",
+    "bronx-ultra/icrm-hitek-full-db-mixed-bucket"
+)
+
+# Bucket ke index files
+PHONE_FILES = [f"idx_phone.{i}.parquet" for i in range(7)]
+AADHAR_FILES = [f"idx_aadhar.{i}.parquet" for i in range(7)]
+
 DUPLICATE_CAP = 2
 
 SEARCH_FIELDS = [
@@ -29,67 +31,73 @@ SEARCH_FIELDS = [
 ]
 NUMBER_FIELDS = ["phoneNumber", "aadharNumber", "otherNumber"]
 
-IDX_PHONE = "idx_phone"
-IDX_AADHAR = "idx_aadhar"
 
-# ✅ SAARI 7+7 index files
-REMOTE_INDEXES = {
-    "phone":  [f"{HF_BUCKET_DUCKDB}/{IDX_PHONE}.{i}.parquet" for i in range(7)],
-    "aadhar": [f"{HF_BUCKET_DUCKDB}/{IDX_AADHAR}.{i}.parquet" for i in range(7)],
-}
-
-# ── DuckDB Pool ─────────────────────────────────────────────────────────────
-_conns: list[duckdb.DuckDBPyConnection] = []
-_conns_lock = threading.Lock()
-_thread_local = threading.local()
-pool = ThreadPoolExecutor(max_workers=PARALLELISM, thread_name_prefix="duck")
-
-
-def _new_conn() -> duckdb.DuckDBPyConnection:
-    con = duckdb.connect()
-    con.execute("SET home_directory='/tmp'")
-    con.execute("SET extension_directory='/tmp/duckdb_extensions'")
-    con.execute("INSTALL parquet; LOAD parquet;")
-    con.execute("INSTALL httpfs; LOAD httpfs;")
-
-    # ✅ HfFileSystem register — buckets ke liye ZAROORI
-    fs = HfFileSystem(token=HF_TOKEN if HF_TOKEN.startswith("hf_") else None)
-    con.register_filesystem(fs)
-
-    for kind, urls in REMOTE_INDEXES.items():
-        lst = ", ".join(f"'{u}'" for u in urls)
-        con.execute(
-            f"CREATE OR REPLACE VIEW people_{kind} AS "
-            f"SELECT * FROM read_parquet([{lst}], union_by_name=true)"
+# ── Parquet Download + Search ───────────────────────────────────────────────
+def _search_in_file(filename: str, field: str, value: str, limit: int = 10) -> list[dict]:
+    """Ek parquet file me search karo."""
+    try:
+        # HuggingFace se file download karo
+        local_path = hf_hub_download(
+            repo_id=HF_BUCKET_REPO,
+            filename=filename,
+            repo_type="bucket",
+            token=HF_TOKEN if HF_TOKEN else None,
         )
-    con.execute(f"SET threads = {THREADS_PER_CONN}")
-    return con
+        
+        # Parquet padho
+        table = pq.read_table(local_path, columns=SEARCH_FIELDS)
+        df = table.to_pandas()
+        
+        # Search karo
+        if field in df.columns:
+            mask = df[field].astype(str).str.strip() == str(value).strip()
+            matches = df[mask]
+            if not matches.empty:
+                # NaN clean karo
+                results = []
+                for _, row in matches.iterrows():
+                    record = {}
+                    for k, v in row.items():
+                        if pd.isna(v):
+                            record[k] = None
+                        else:
+                            record[k] = v
+                    results.append(record)
+                    if len(results) >= limit:
+                        break
+                return results
+        return []
+    except Exception as e:
+        print(f"⚠️ Error in {filename}: {e}")
+        return []
 
 
-def _tid() -> int:
-    tid = getattr(_thread_local, "id", None)
-    if tid is None:
-        with _conns_lock:
-            tid = len(_conns)
-            _thread_local.id = tid
-    return tid
-
-
-def _get_conn() -> duckdb.DuckDBPyConnection:
-    ident = _tid()
-    with _conns_lock:
-        while len(_conns) <= ident:
-            _conns.append(_new_conn())
-    return _conns[ident]
+def _search_field(field: str, value: str, limit: int = 10) -> list[dict]:
+    """Saari files me search karo — parallel."""
+    if field in ("phoneNumber", "otherNumber"):
+        files = PHONE_FILES
+    elif field == "aadharNumber":
+        files = AADHAR_FILES
+    else:
+        files = PHONE_FILES
+    
+    all_results = []
+    for filename in files:
+        results = _search_in_file(filename, field, value, limit)
+        all_results.extend(results)
+        if len(all_results) >= limit:
+            break
+    
+    return all_results
 
 
 # ── Dedup ───────────────────────────────────────────────────────────────────
-def _key(row: dict) -> tuple:
-    ph = (row.get("phoneNumber") or "").strip()
-    ad = (row.get("aadharNumber") or "").strip()
+def _person_key(row: dict) -> tuple:
+    ph = str(row.get("phoneNumber") or "").strip()
+    ad = str(row.get("aadharNumber") or "").strip()
     if ph or ad:
         return (ph, ad)
-    return (row.get("name") or "").strip(), (row.get("fathersName") or "").strip()
+    return (str(row.get("name") or ""), str(row.get("fathersName") or ""))
 
 
 def _connected(row: dict) -> list[dict]:
@@ -99,17 +107,17 @@ def _connected(row: dict) -> list[dict]:
         if v is None:
             continue
         s = str(v).strip()
-        if not s or s in seen:
+        if not s or s == "nan" or s in seen:
             continue
         seen.add(s)
         out.append({"field": f, "value": s})
     return out
 
 
-def _cap(rows: list[dict]) -> list[dict]:
+def _cap_duplicates(rows: list[dict]) -> list[dict]:
     seen, out = {}, []
     for r in rows:
-        k = _key(r)
+        k = _person_key(r)
         n = seen.get(k, 0)
         if n < DUPLICATE_CAP:
             seen[k] = n + 1
@@ -119,76 +127,52 @@ def _cap(rows: list[dict]) -> list[dict]:
     return out
 
 
-# ── Search ──────────────────────────────────────────────────────────────────
-def _field_search(field: str, value: str, mode: str, limit: int) -> dict:
-    if field not in SEARCH_FIELDS:
-        raise ValueError(f"Unknown field: {field}")
-    v = value.replace("'", "''")
-
-    if mode == "exact":
-        if field == "phoneNumber":
-            view = "people_phone"
-        elif field == "aadharNumber":
-            view = "people_aadhar"
-        else:
-            return {"field": field, "value": value, "mode": mode,
-                    "count": 0, "results": []}
-        sql = (f"SELECT * FROM {view} WHERE {field} = '{v}' "
-               f"LIMIT {limit * DUPLICATE_CAP + 20}")
-    elif mode == "contains":
-        v2 = v.replace("%", r"\%").replace("_", r"\_")
-        sql = (f"SELECT * FROM people_phone WHERE {field} ILIKE '%{v2}%' "
-               f"ESCAPE '\\' LIMIT {limit * DUPLICATE_CAP + 20}")
-    else:
-        raise ValueError(f"Unknown mode: {mode}")
-
-    con = _get_conn()
-    rows = con.execute(sql).fetchall()
-    cols = [d[0] for d in con.description]
-    results = _cap([dict(zip(cols, r)) for r in rows])[:limit]
-    return {"field": field, "value": value, "mode": mode,
-            "count": len(results), "results": results}
-
-
-def _unified(q: str, limit: int = 10) -> dict:
+# ── Unified Search ──────────────────────────────────────────────────────────
+def _unified_search(q: str, limit: int = 10) -> dict:
     q = q.strip()
     if not q or not q.isdigit() or len(q) < 8:
         return {"query": q, "searched_fields": [], "count": 0, "results": []}
-
+    
     all_rows, searched = [], []
-
+    
     # Phone pehle
-    r = _field_search("phoneNumber", q, "exact", limit)
-    all_rows.extend(r["results"])
-    searched.append("phoneNumber")
-
-    # Aadhar agar phone me nahi mila
-    if not all_rows:
-        r = _field_search("aadharNumber", q, "exact", limit)
-        all_rows.extend(r["results"])
-        searched.append("aadharNumber")
-
-    # Enrich — connected numbers
+    if len(q) in (10, 11):
+        rows = _search_field("phoneNumber", q, limit)
+        if rows:
+            all_rows.extend(rows)
+            searched.append("phoneNumber")
+    
+    # Aadhar
+    if len(q) == 12:
+        rows = _search_field("aadharNumber", q, limit)
+        if rows:
+            all_rows.extend(rows)
+            searched.append("aadharNumber")
+    
+    # Enrich
     if all_rows:
         seen_nums = set()
-        for row in all_rows[:3]:
+        for row in all_rows[:2]:
             for nf in NUMBER_FIELDS:
                 nv = row.get(nf)
                 if nv and str(nv) not in seen_nums:
                     seen_nums.add(str(nv))
-                    extra = _field_search(nf, str(nv), "exact", 2)
-                    if extra["count"]:
-                        all_rows.extend(extra["results"])
+                    extra = _search_field(nf, str(nv), 2)
+                    if extra:
+                        all_rows.extend(extra)
                         if nf not in searched:
                             searched.append(nf)
+    
+    all_rows = _cap_duplicates(all_rows)[:limit]
+    
+    return {
+        "query": q, "searched_fields": searched,
+        "count": len(all_rows), "results": all_rows,
+    }
 
-    all_rows = _cap(all_rows)[:limit]
-    return {"query": q, "searched_fields": searched,
-            "count": len(all_rows), "results": all_rows}
 
-
-# ── FastAPI ────────────────────────────────────────────────────────────────
-app = FastAPI(title="ICMR + HITEK Search API")
+# ── FastAPI App ─────────────────────────────────────────────────────────────
+app = FastAPI(title="ICMR Search API")
 
 
 class BatchRequest(BaseModel):
@@ -229,8 +213,8 @@ UI = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-  <h1>🔍 ICMR Full Info Search</h1>
-  <div class="sub">Phone ya Aadhaar daalo — pura info milega</div>
+  <h1>🔍 ICMR Search</h1>
+  <div class="sub">Phone ya Aadhaar daalo</div>
   <div class="row">
     <input id="q" placeholder="10-digit phone ya 12-digit aadhar..." autofocus>
     <button id="btn" onclick="go()">Search</button>
@@ -287,36 +271,36 @@ def ui():
 def health():
     return {
         "status": "ok",
-        "bucket": HF_BUCKET_ID,
-        "token_loaded": bool(HF_TOKEN and HF_TOKEN.startswith("hf_")),
+        "bucket": HF_BUCKET_REPO,
+        "token_loaded": bool(HF_TOKEN),
     }
 
 
 @app.get("/debug")
 def debug():
-    """PEHLE YE CHALAO — bucket + token check."""
+    """PEHLE YE CHALAO."""
     try:
-        con = _get_conn()
-        sample = con.execute(
-            f"SELECT * FROM read_parquet('{REMOTE_INDEXES['phone'][0]}', "
-            f"union_by_name=true) LIMIT 1"
-        ).fetchdf()
-        files = con.execute(
-            f"SELECT COUNT(*) FROM glob('{HF_BUCKET_DUCKDB}/{IDX_PHONE}.*.parquet')"
-        ).fetchone()[0]
-        con.close()
+        # Ek file try karo
+        path = hf_hub_download(
+            repo_id=HF_BUCKET_REPO,
+            filename=PHONE_FILES[0],
+            repo_type="bucket",
+            token=HF_TOKEN if HF_TOKEN else None,
+        )
+        # Columns check karo
+        schema = pq.read_schema(path)
         return {
             "status": "connected",
-            "bucket": HF_BUCKET_ID,
-            "token_loaded": bool(HF_TOKEN and HF_TOKEN.startswith("hf_")),
-            "phone_files_found": files,
-            "columns": list(sample.columns) if not sample.empty else [],
+            "bucket": HF_BUCKET_REPO,
+            "token_loaded": bool(HF_TOKEN),
+            "file": PHONE_FILES[0],
+            "columns": schema.names,
         }
     except Exception as e:
         return {
             "status": "error",
-            "bucket": HF_BUCKET_ID,
-            "token_loaded": bool(HF_TOKEN and HF_TOKEN.startswith("hf_")),
+            "bucket": HF_BUCKET_REPO,
+            "token_loaded": bool(HF_TOKEN),
             "error": str(e),
         }
 
@@ -325,25 +309,16 @@ def debug():
 async def search(
     q: str | None = Query(None),
     mobile: str | None = Query(None),
-    field: str | None = Query(None),
-    mode: str = Query("exact"),
-    limit: int = Query(10, ge=1, le=1000),
+    limit: int = Query(10, ge=1, le=100),
     pretty: bool = Query(True),
 ):
     q_val = (q or mobile or "").strip()
     if not q_val:
         raise HTTPException(422, "Provide q or mobile")
-
+    
     loop = asyncio.get_running_loop()
-    if field:
-        data = await loop.run_in_executor(
-            pool, _field_search, field, q_val, mode, limit
-        )
-    else:
-        data = await loop.run_in_executor(pool, _unified, q_val, limit)
-
-    result = {"success": bool(data["count"]), **data,
-              "number": q_val, "total": data["count"]}
+    data = await loop.run_in_executor(None, _unified_search, q_val, limit)
+    result = {"success": bool(data["count"]), **data, "number": q_val}
     content = json.dumps(result, indent=2 if pretty else None,
                          ensure_ascii=False, default=str)
     return Response(content=content, media_type="application/json")
@@ -352,12 +327,12 @@ async def search(
 @app.get("/info/{number}")
 async def full_info(
     number: str,
-    limit: int = Query(10, ge=1, le=1000),
+    limit: int = Query(10, ge=1, le=100),
     pretty: bool = Query(True),
 ):
     number = number.strip()
     loop = asyncio.get_running_loop()
-    data = await loop.run_in_executor(pool, _unified, number, limit)
+    data = await loop.run_in_executor(None, _unified_search, number, limit)
     result = {
         "success": bool(data["count"]),
         "number": number,
@@ -371,34 +346,6 @@ async def full_info(
     content = json.dumps(result, indent=2 if pretty else None,
                          ensure_ascii=False, default=str)
     return Response(content=content, media_type="application/json")
-
-
-@app.post("/search/parallel")
-async def search_parallel(req: BatchRequest):
-    if not req.queries:
-        raise HTTPException(400, "queries must not be empty")
-    if len(req.queries) > 50:
-        raise HTTPException(400, "max 50 queries per batch")
-
-    loop = asyncio.get_running_loop()
-    tasks = [
-        loop.run_in_executor(
-            pool, _field_search,
-            item.get("field", "phoneNumber"),
-            item.get("value", ""),
-            item.get("mode", "exact"),
-            int(item.get("limit", req.limit)),
-        )
-        for item in req.queries
-    ]
-    results = await asyncio.gather(*tasks)
-    return Response(
-        content=json.dumps(
-            {"searches": len(req.queries), "results": list(results)},
-            indent=2, ensure_ascii=False, default=str,
-        ),
-        media_type="application/json",
-    )
 
 
 # ── Pinger ──────────────────────────────────────────────────────────────────
