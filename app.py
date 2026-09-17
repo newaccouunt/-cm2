@@ -16,7 +16,7 @@ from pydantic import BaseModel
 BASE = os.path.dirname(os.path.abspath(__file__))
 
 # 🔑 APNA HF TOKEN YAHAN DAALO (ya Render env var se set karo)
-HF_TOKEN = os.environ.get("HF_TOKEN", "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")
+HF_TOKEN = os.environ.get("HF_TOKEN", "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")
 
 # ✅ Bucket details
 HF_BUCKET_ID = "bronx-ultra/icrm-hitek-full-db-mixed-bucket"
