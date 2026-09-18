@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: hitek-search-api
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: HF_ACCESS_KEY_ID
+        sync: false
+      - key: HF_SECRET_ACCESS_KEY
+        sync: false
+      - key: PORT
+        value: 8000
