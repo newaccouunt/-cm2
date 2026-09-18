@@ -1,7 +1,4 @@
 fastapi
 uvicorn[standard]
 duckdb
-gradio
-httpx
 pydantic
-huggingface_hub
