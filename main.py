@@ -1,195 +1,261 @@
-from fastapi import FastAPI, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
-from starlette.exceptions import HTTPException as StarletteHTTPException
-import duckdb
 import os
+import asyncio
+import json
 import threading
-import time
-import logging
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("hitek")
+import duckdb
+import gradio as gr
+import httpx
+from fastapi import FastAPI, HTTPException, Query, Response
+from pydantic import BaseModel
 
-app = FastAPI(title="Hitek Data Gateway", version="2.1")
+# ── ✅ MASTER FIX: Hugging Face Buckets ke liye hf:// protocol ──
+from huggingface_hub import HfFileSystem
 
-# ---------- DuckDB ----------
-con = duckdb.connect(database=":memory:")
-try:
-    con.execute("INSTALL httpfs;")
-    con.execute("LOAD httpfs;")
-    con.execute("SET enable_http_metadata_cache=true;")
-    con.execute("SET enable_object_cache=true;")
-    log.info("[DuckDB] httpfs loaded successfully")
-except Exception as e:
-    log.error(f"[DuckDB] httpfs setup failed: {e}")
+# DuckDB ko HF filesystem ke baare mein batao (buckets ke liye zaroori)
+duckdb.register_filesystem(HfFileSystem())
 
-# ---------- ✅ FIXED URL — buckets, NOT datasets ----------
-HF_BASE = "https://huggingface.co/buckets/CutehackX/hitek-data-bucket/resolve/main"
+# ── Config ──
+BASE = os.path.dirname(os.path.abspath(__file__))
+# ✅ NAYA BUCKET PATH (datasets nahi, buckets)
+HF_BUCKET_PATH = "hf://buckets/bronx-ultra/icrm-hitek-full-db-mixed-bucket"
 
-SHARDS = list("0123456789")
-loaded_shards = set()
-load_lock = threading.Lock()
+PARALLELISM = int(os.environ.get("ICMR_PARALLEL", "2"))
+THREADS_PER_CONN = int(os.environ.get("ICMR_THREADS_PER_CONN", "2"))
+DUPLICATE_CAP = 2
 
-# ---------- Landing Page (same as before) ----------
-LANDING_PAGE_HTML = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Hitek Data Gateway - LIVE</title>
-    <style>
-        body { margin: 0; overflow: hidden; background-color: #050505; color: #00ffcc; font-family: 'Courier New', Courier, monospace; }
-        #canvas-container { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: -1; }
-        .overlay { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; background: rgba(10, 10, 10, 0.85); padding: 50px; border: 1px solid #00ffcc; border-radius: 12px; box-shadow: 0 0 30px rgba(0, 255, 204, 0.3); backdrop-filter: blur(5px); }
-        h1 { margin: 0 0 15px 0; font-size: 3.5em; text-transform: uppercase; letter-spacing: 6px; text-shadow: 0 0 15px #00ffcc; }
-        p { font-size: 1.2em; margin: 8px 0; color: #ccc; }
-        .highlight { color: #00ffcc; font-weight: bold; }
-        .status-box { margin-top: 30px; font-weight: bold; padding: 15px; border-radius: 8px; background: rgba(0, 255, 204, 0.1); border: 1px solid rgba(0, 255, 204, 0.5); font-size: 1.1em; }
-        .blinking { animation: blinker 1.5s linear infinite; display: inline-block; }
-        @keyframes blinker { 50% { opacity: 0; } }
-    </style>
-</head>
-<body>
-    <div id="canvas-container"></div>
-    <div class="overlay">
-        <h1>SYSTEM ONLINE</h1>
-        <p>API Gateway is <span class="highlight">Active & Secured</span></p>
-        <p>Parquet Cloud Engine: <span class="highlight">Connected</span></p>
-        <div class="status-box"><span class="blinking" style="color: #00ffcc;">●</span> HTTP 200 OK - LISTENING FOR QUERIES</div>
-    </div>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-    <script>
-        const scene = new THREE.Scene();
-        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 2000);
-        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-        renderer.setSize(window.innerWidth, window.innerHeight);
-        document.getElementById('canvas-container').appendChild(renderer.domElement);
-        const geometry = new THREE.BufferGeometry();
-        const vertices = [];
-        for (let i = 0; i < 8000; i++) {
-            vertices.push(THREE.MathUtils.randFloatSpread(3000));
-            vertices.push(THREE.MathUtils.randFloatSpread(3000));
-            vertices.push(THREE.MathUtils.randFloatSpread(3000));
-        }
-        geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
-        const material = new THREE.PointsMaterial({ color: 0x00ffcc, size: 2.5, transparent: true, opacity: 0.8 });
-        const points = new THREE.Points(geometry, material);
-        scene.add(points);
-        camera.position.z = 1200;
-        function animate() {
-            requestAnimationFrame(animate);
-            points.rotation.x += 0.0005;
-            points.rotation.y += 0.001;
-            renderer.render(scene, camera);
-        }
-        animate();
-        window.addEventListener('resize', () => {
-            camera.aspect = window.innerWidth / window.innerHeight;
-            camera.updateProjectionMatrix();
-            renderer.setSize(window.innerWidth, window.innerHeight);
-        });
-    </script>
-</body>
-</html>
-"""
+SEARCH_FIELDS = [
+    "name", "fathersName", "phoneNumber", "aadharNumber", "otherNumber",
+    "address", "district", "pincode", "state", "town", "source",
+]
+NUMBER_FIELDS = ["phoneNumber", "aadharNumber", "otherNumber"]
 
-# ---------- ❌ PRELOADING DISABLED ----------
-# Tere files 5.4 GB each hain — 10 shards = 50+ GB. Render free tier = 512 MB.
-# Preload IMPOSSIBLE hai. Direct HF read hi karna padega.
-# Isliye preload function hata diya.
+# ── DuckDB Connection Pool ──
+_conns: list[duckdb.DuckDBPyConnection] = []
+_conns_lock = threading.Lock()
+_thread_local = threading.local()
+pool = ThreadPoolExecutor(max_workers=PARALLELISM, thread_name_prefix="duck")
 
-@app.on_event("startup")
-async def startup_event():
-    log.info("[Startup] Using direct HuggingFace parquet reads (no preload — files too large)")
+def _new_conn() -> duckdb.DuckDBPyConnection:
+    con = duckdb.connect()
+    con.execute("SET home_directory='/tmp'")
+    con.execute("SET extension_directory='/tmp/duckdb_extensions'")
+    con.execute("INSTALL parquet; LOAD parquet;")
+    con.execute("INSTALL httpfs; LOAD httpfs;")
+    
+    # ✅ Buckets ke liye views banao (hf:// protocol)
+    phone_urls = [f"{HF_BUCKET_PATH}/idx_phone.{i}.parquet" for i in range(7)]
+    aadhar_urls = [f"{HF_BUCKET_PATH}/idx_aadhar.{i}.parquet" for i in range(7)]
+    
+    # Phone index view
+    phone_lst = ", ".join(f"'{u}'" for u in phone_urls)
+    con.execute(f"CREATE OR REPLACE VIEW people_phone AS SELECT * FROM read_parquet([{phone_lst}])")
+    
+    # Aadhar index view
+    aadhar_lst = ", ".join(f"'{u}'" for u in aadhar_urls)
+    con.execute(f"CREATE OR REPLACE VIEW people_aadhar AS SELECT * FROM read_parquet([{aadhar_lst}])")
+    
+    con.execute(f"SET threads = {THREADS_PER_CONN}")
+    return con
 
+def _get_conn() -> duckdb.DuckDBPyConnection:
+    ident = getattr(_thread_local, "id", None)
+    if ident is None:
+        with _conns_lock:
+            ident = len(_conns)
+            _thread_local.id = ident
+    with _conns_lock:
+        while len(_conns) <= ident:
+            _conns.append(_new_conn())
+    return _conns[ident]
 
-# ---------- Exception Handler ----------
-@app.exception_handler(StarletteHTTPException)
-async def custom_http_exception_handler(request: Request, exc: StarletteHTTPException):
-    if exc.status_code == 404:
-        return JSONResponse(status_code=404, content={
-            "status": "rejected",
-            "message": "Invalid endpoint. STRICTLY use /FetchData?Number=XXXXXXXXXX",
-            "Developer": "@Maybechx"
-        })
-    return JSONResponse(status_code=exc.status_code, content={
-        "detail": exc.detail, "Developer": "@Maybechx"
-    })
+# ── Dedup & Connected Records (same as your old code) ──
+def _person_key(row: dict) -> tuple:
+    ph = (row.get("phoneNumber") or "").strip()
+    ad = (row.get("aadharNumber") or "").strip()
+    if ph or ad:
+        return (ph, ad)
+    return (row.get("name") or "").strip(), (row.get("fathersName") or "").strip()
 
+def _connected_numbers(row: dict) -> list[dict]:
+    connected, seen = [], set()
+    for field in NUMBER_FIELDS:
+        raw = row.get(field)
+        if raw is None: continue
+        value = str(raw).strip()
+        if not value or value in seen: continue
+        seen.add(value)
+        connected.append({"field": field, "value": value})
+    return connected
 
-# ---------- Routes ----------
-@app.get("/", response_class=HTMLResponse)
-def root_landing_page():
-    return HTMLResponse(content=LANDING_PAGE_HTML, status_code=200)
+def _cap_duplicates(rows: list[dict]) -> list[dict]:
+    seen: dict[tuple, int] = {}
+    out = []
+    for r in rows:
+        k = _person_key(r)
+        n = seen.get(k, 0)
+        if n < DUPLICATE_CAP:
+            seen[k] = n + 1
+            record = dict(r)
+            record["connected_numbers"] = _connected_numbers(record)
+            out.append(record)
+    return out
 
+# ── Search Logic (same as your old code) ──
+def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
+    if field not in SEARCH_FIELDS:
+        raise ValueError(f"Unknown field: {field}")
+    v = value.replace("'", "''")
 
-@app.get("/health")
+    if mode == "exact":
+        if field == "phoneNumber":
+            view = "people_phone"
+        elif field == "aadharNumber":
+            view = "people_aadhar"
+        else:
+            return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
+        sql = f"SELECT * FROM {view} WHERE {field} = '{v}' LIMIT {limit * DUPLICATE_CAP + 20}"
+    elif mode == "contains":
+        if field == "name":
+            return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
+        v2 = v.replace("%", r"\%").replace("_", r"\_")
+        sql = f"SELECT * FROM people_phone WHERE {field} ILIKE '%{v2}%' ESCAPE '\\' LIMIT {limit * DUPLICATE_CAP + 20}"
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    con = _get_conn()
+    rows = con.execute(sql).fetchall()
+    cols = [d[0] for d in con.description]
+    results = _cap_duplicates([dict(zip(cols, r)) for r in rows])[:limit]
+    return {"field": field, "value": value, "mode": mode, "count": len(results), "results": results}
+
+def _unified_search(q: str, limit: int = 10) -> dict:
+    q = q.strip()
+    is_num = q.isdigit() and len(q) >= 8
+    if is_num:
+        all_rows = []
+        searched = []
+        r = _run_field_search("phoneNumber", q, "exact", limit)
+        all_rows.extend(r["results"]); searched.append("phoneNumber")
+        if not all_rows:
+            r = _run_field_search("aadharNumber", q, "exact", limit)
+            all_rows.extend(r["results"]); searched.append("aadharNumber")
+        all_rows = _cap_duplicates(all_rows)[:limit]
+        return {"query": q, "searched_fields": searched, "count": len(all_rows), "results": all_rows}
+    else:
+        return {"query": q, "searched_fields": [], "count": 0, "results": []}
+
+# ── FastAPI + Gradio (same as your old code, no changes needed) ──
+fastapi_app = FastAPI(title="ICMR + HITEK Search API")
+
+class BatchRequest(BaseModel):
+    queries: list[dict[str, Any]]
+    limit: int = 10
+
+@fastapi_app.get("/")
+def root():
+    return {
+        "app": "ICMR + HITEK Search API",
+        "records": 2_504_793_870,
+        "indexes": {"phone": True, "aadhar": True},
+        "columns": SEARCH_FIELDS,
+        "docs": "/docs",
+        "developer": "@kzr0x | channel @api_wallah",
+    }
+
+@fastapi_app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "mode": "direct-read",
-        "bucket": HF_BASE,
-        "Developer": "@Maybechx"
-    }
+    return {"status": "ok", "indexes": {"phone": True, "aadhar": True}}
 
+@fastapi_app.get("/search")
+async def search(q: str | None = Query(None), mobile: str | None = Query(None), field: str | None = Query(None), mode: str = Query("exact"), limit: int = Query(10, ge=1, le=1000), pretty: bool = Query(True)):
+    q_val = (q or mobile or "").strip()
+    if not q_val:
+        raise HTTPException(422, "Provide q or mobile")
+    loop = asyncio.get_running_loop()
+    if field:
+        data = await loop.run_in_executor(pool, _run_field_search, field, q_val, mode, limit)
+    else:
+        data = await loop.run_in_executor(pool, _unified_search, q_val, limit)
+    result = {"success": bool(data["count"]), **data, "number": q_val, "total": data["count"]}
+    content = json.dumps(result, indent=2 if pretty else None, ensure_ascii=False)
+    return Response(content=content, media_type="application/json")
 
-@app.get("/FetchData")
-def fetch_data(Number: str = Query(None)):
-    # ---- Validation ----
-    if not Number or not Number.isdigit() or not (10 <= len(Number) <= 15):
-        return JSONResponse(status_code=400, content={
-            "status": "rejected",
-            "message": "Invalid parameter. STRICTLY use /FetchData?Number=XXXXXXXXXX",
-            "Developer": "@Maybechx"
-        })
+@fastapi_app.post("/search/parallel")
+async def search_parallel(req: BatchRequest):
+    if not req.queries:
+        raise HTTPException(400, "queries must not be empty")
+    if len(req.queries) > 50:
+        raise HTTPException(400, "max 50 queries per batch")
+    loop = asyncio.get_running_loop()
+    tasks = [loop.run_in_executor(pool, _run_field_search, item.get("field", "phoneNumber"), item.get("value", ""), item.get("mode", "exact"), int(item.get("limit", req.limit))) for item in req.queries]
+    results = await asyncio.gather(*tasks)
+    return Response(content=json.dumps({"searches": len(req.queries), "results": list(results)}, indent=2, ensure_ascii=False), media_type="application/json")
 
-    last_digit = Number[-1]
-    main_url = f"{HF_BASE}/final_master_shard_{last_digit}.parquet"
-    alt_url = f"{HF_BASE}/alt_master_shard_{last_digit}.parquet"
+# ── Pinger ──
+async def pinger():
+    port = os.getenv("PORT", "7860")
+    url = f"http://localhost:{port}/health"
+    async with httpx.AsyncClient(timeout=10) as client:
+        while True:
+            await asyncio.sleep(120)
+            try:
+                resp = await client.get(url)
+                print(f"[Pinger] {resp.status_code}")
+            except Exception as e:
+                print(f"[Pinger] Error: {e}")
 
-    log.info(f"[Fetch] Number={Number} shard={last_digit}")
+@fastapi_app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(pinger())
 
-    main_records, alt_records = [], []
+# ── Gradio UI (same as your old code) ──
+def format_result(row: dict) -> str:
+    lines = []
+    for field in SEARCH_FIELDS:
+        val = row.get(field, "")
+        if val:
+            lines.append(f"**{field}:** {val}")
+    cn = row.get("connected_numbers", [])
+    if cn:
+        nums = ", ".join(f"{c['field']}={c['value']}" for c in cn)
+        lines.append(f"**connected:** {nums}")
+    return "\n\n".join(lines)
 
-    # Main shard query
+def search_ui(query: str, limit: int) -> str:
+    if not query or not query.strip():
+        return "⚠️ Kuch toh search karo — phone, aadhar, ya name daalo."
+    q = query.strip()
     try:
-        main_records = con.execute(
-            "SELECT * FROM read_parquet(?) WHERE mobile = ?",
-            [main_url, Number]
-        ).df().to_dict(orient="records")
-        log.info(f"[Main] {len(main_records)} records found")
+        data = _unified_search(q, int(limit))
     except Exception as e:
-        log.error(f"[Main error] {e}")
+        return f"❌ Error: {str(e)}"
+    count = data["count"]
+    results = data["results"]
+    searched = ", ".join(data.get("searched_fields", []))
+    if not results:
+        return f"🔍 **Query:** `{q}`\n**Searched:** {searched}\n\n❌ **No data found** for this number."
+    header = f"🔍 **Query:** `{q}`  |  **Found:** {count} results  |  **Searched:** {searched}\n\n---\n\n"
+    parts = [f"### Result {i}\n{format_result(row)}" for i, row in enumerate(results, 1)]
+    return header + "\n\n---\n\n".join(parts)
 
-    # Alt shard query
-    try:
-        alt_records = con.execute(
-            "SELECT * FROM read_parquet(?) WHERE alt = ?",
-            [alt_url, Number]
-        ).df().to_dict(orient="records")
-        log.info(f"[Alt] {len(alt_records)} records found")
-    except Exception as e:
-        log.error(f"[Alt error] {e}")
+def build_ui():
+    with gr.Blocks(title="ICMR Search API", theme=gr.themes.Soft()) as demo:
+        gr.Markdown("# 🔍 ICMR + HITEK Search API")
+        gr.Markdown("Search **2.5 billion records** — phone, Aadhaar, name, address & more")
+        with gr.Row():
+            with gr.Column(scale=3):
+                query_input = gr.Textbox(label="Search Query", placeholder="Phone number, Aadhaar, ya name daalo...", lines=1)
+            with gr.Column(scale=1):
+                limit_slider = gr.Slider(minimum=1, maximum=50, value=10, step=1, label="Max Results")
+        search_btn = gr.Button("🔍 Search", variant="primary", size="lg")
+        output = gr.Markdown(label="Results")
+        search_btn.click(fn=search_ui, inputs=[query_input, limit_slider], outputs=output)
+        query_input.submit(fn=search_ui, inputs=[query_input, limit_slider], outputs=output)
+        gr.Markdown("---\n👨‍💻 **Developer:** @kzr0x  |  📢 **Channel:** @api_wallah")
+    return demo
 
-    if not main_records and not alt_records:
-        return JSONResponse(status_code=404, content={
-            "status": "not_found",
-            "phone": Number,
-            "Developer": "@Maybechx"
-        })
-
-    return {
-        "status": "success",
-        "Data": {
-            "Main_Records": main_records,
-            "Alt_Records": alt_records
-        },
-        "Developer": "@Maybechx"
-    }
-
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+demo = build_ui()
+app = gr.mount_gradio_app(fastapi_app, demo, path="/")
