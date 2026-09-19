@@ -4,4 +4,3 @@ gradio
 httpx
 pydantic
 pandas
-pyarrow
