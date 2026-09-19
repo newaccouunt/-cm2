@@ -4,3 +4,4 @@ gradio
 httpx
 pydantic
 pandas
+duckdb
