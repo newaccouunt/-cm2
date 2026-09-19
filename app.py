@@ -19,7 +19,7 @@ from io import BytesIO
 # ── Config ──────────────────────────────────────────────────────────────────
 HF_DATASET_URL = os.environ.get(
     "ICMR_HF_DATASET_URL",
-    "https://huggingface.co/datasets/rehuuuu/icrm-hitek-fulldb/resolve/main",
+    "https://huggingface.co/datasets/rehuuuu/icrm-hitek-fulldb",
 ).rstrip("/")
 
 HF_REPO_ID = "rehuuuu/icrm-hitek-fulldb"
