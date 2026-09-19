@@ -12,15 +12,14 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Response
 from pydantic import BaseModel
 import pandas as pd
+import duckdb
 
 # ── Config ──────────────────────────────────────────────────────────────────
-HF_DATASET = os.environ.get("ICMR_HF_DATASET", "rehuuuu/icrm-hitek-fulldb")
-HF_CONFIG = os.environ.get("ICMR_HF_CONFIG", "default")
-HF_SPLIT = os.environ.get("ICMR_HF_SPLIT", "train")
-HF_API_BASE = "https://datasets-server.huggingface.co"
+HF_DATASET = "rehuuuu/icrm-hitek-fulldb"
+PARQUET_API = f"https://huggingface.co/api/datasets/{HF_DATASET}/parquet/default/train"
 
 PARALLELISM = int(os.environ.get("ICMR_PARALLEL", "2"))
-TIMEOUT = int(os.environ.get("ICMR_TIMEOUT", "120"))
+TIMEOUT = int(os.environ.get("ICMR_TIMEOUT", "180"))
 DUPLICATE_CAP = 2
 
 SEARCH_FIELDS = [
@@ -29,54 +28,88 @@ SEARCH_FIELDS = [
 ]
 NUMBER_FIELDS = ["phoneNumber", "aadharNumber", "otherNumber"]
 
-# ── Thread Pool ─────────────────────────────────────────────────────────────
+# ── Auto-discover parquet files ─────────────────────────────────────────────
+_parquet_cache: dict[str, list[str]] = {}
+_parquet_lock = threading.Lock()
+
+async def discover_parquet_files(client: httpx.AsyncClient) -> dict[str, list[str]]:
+    global _parquet_cache
+    if _parquet_cache:
+        return _parquet_cache
+
+    found = {"phone": [], "aadhar": [], "other": []}
+    try:
+        r = await client.get(PARQUET_API, timeout=60)
+        if r.status_code == 200:
+            files = r.json()
+            for url in files:
+                found["other"].append(url)
+                found["phone"].append(url)
+                found["aadhar"].append(url)
+            print(f"✅ HF parquet API se {len(files)} files mili")
+    except Exception as e:
+        print(f"⚠️ HF parquet API fail: {e}")
+
+    with _parquet_lock:
+        _parquet_cache = found
+    print(f"📦 Discovered: phone={len(found['phone'])}, aadhar={len(found['aadhar'])}, other={len(found['other'])}")
+    return found
+
+# ── DuckDB HTTP range search (no download) ──────────────────────────────────
 pool = ThreadPoolExecutor(max_workers=PARALLELISM, thread_name_prefix="search")
 
-# ── HF Dataset Viewer API Search ────────────────────────────────────────────
-async def _hf_search(field: str, value: str, limit: int = 10) -> list[dict]:
-    """
-    Use Hugging Face Dataset Viewer API to search server-side.
-    No file download needed. Works even for 227GB datasets.
-    """
-    url = f"{HF_API_BASE}/filter"
-    params = {
-        "dataset": HF_DATASET,
-        "config": HF_CONFIG,
-        "split": HF_SPLIT,
-        "where": f"\"{field}\"='{value}'",
-        "limit": str(limit),
-        "offset": "0",
-    }
+def _duckdb_search_sync(field: str, value: str, files: list[str], limit: int) -> list[dict]:
+    """DuckDB se HTTP range requests ke through search — full download nahi."""
+    results = []
+    con = duckdb.connect()
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
-            r = await client.get(url, params=params)
-            if r.status_code == 200:
-                data = r.json()
-                rows = data.get("rows", [])
-                # HF returns list of {"row": {...}, "row_idx": n}
-                out = []
-                for item in rows:
-                    row = item.get("row", {}) if isinstance(item, dict) else {}
-                    if row:
-                        out.append(row)
-                print(f"✅ HF API: {field}='{value}' -> {len(out)} rows")
-                return out
-            else:
-                print(f"⚠️ HF API error {r.status_code}: {r.text[:200]}")
-                return []
+        con.execute("INSTALL httpfs; LOAD httpfs;")
+        con.execute("SET enable_http_metadata_cache=true;")
+        con.execute("SET http_timeout=120000;")  # 120s
     except Exception as e:
-        print(f"❌ HF API exception: {e}")
+        print(f"⚠️ DuckDB setup fail: {e}")
+        con.close()
         return []
 
-async def _hf_search_multi(fields: list[str], value: str, limit: int = 10) -> list[dict]:
-    """Search same value across multiple fields in parallel."""
-    tasks = [_hf_search(f, value, limit) for f in fields]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    out = []
-    for r in results:
-        if isinstance(r, list):
-            out.extend(r)
-    return out
+    for url in files:
+        try:
+            q = f"""
+                SELECT * FROM read_parquet('{url}')
+                WHERE CAST("{field}" AS VARCHAR) = '{value}'
+                LIMIT {limit}
+            """
+            df = con.execute(q).fetchdf()
+            if not df.empty:
+                results.extend(df.to_dict("records"))
+                if len(results) >= limit:
+                    break
+        except Exception as e:
+            print(f"⚠️ DuckDB {url}: {e}")
+
+    con.close()
+    return results[:limit]
+
+async def search_in_parquet(field: str, value: str, limit: int = 10) -> list:
+    async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
+        files_map = await discover_parquet_files(client)
+
+        if field == "aadharNumber":
+            files = files_map["aadhar"] + files_map["other"]
+        elif field in ("phoneNumber", "otherNumber"):
+            files = files_map["phone"] + files_map["other"]
+        else:
+            files = files_map["phone"] + files_map["aadhar"] + files_map["other"]
+
+        if not files:
+            print("⚠️ No parquet files discovered!")
+            return []
+
+        loop = asyncio.get_running_loop()
+        # DuckDB search ek thread mein chalao (HTTP range requests)
+        results = await loop.run_in_executor(
+            pool, _duckdb_search_sync, field, value, files, limit
+        )
+        return results
 
 # ── Dedup & Connected Records ───────────────────────────────────────────────
 def _connected_numbers(row: dict) -> list[dict]:
@@ -122,36 +155,43 @@ def _run_async(coro):
 # ── Search Logic ────────────────────────────────────────────────────────────
 def _unified_search_sync(q: str, limit: int = 10) -> dict:
     q = q.strip()
-    if not q:
+    is_num = q.isdigit() and len(q) >= 8
+
+    if not is_num:
         return {"query": q, "searched_fields": [], "count": 0, "results": []}
 
-    is_num = q.isdigit() and len(q) >= 8
     all_rows = []
     searched = []
 
-    if is_num:
-        # Try phone
-        if 8 <= len(q) <= 13:
-            rows = _run_async(_hf_search("phoneNumber", q, limit))
-            if rows:
-                all_rows.extend(rows); searched.append("phoneNumber")
-        # Try aadhar
-        if len(q) == 12:
-            rows = _run_async(_hf_search("aadharNumber", q, limit))
-            if rows:
-                all_rows.extend(rows); searched.append("aadharNumber")
-        # Fallback: otherNumber
-        if not all_rows:
-            rows = _run_async(_hf_search("otherNumber", q, limit))
-            if rows:
-                all_rows.extend(rows); searched.append("otherNumber")
-    else:
-        # Text search on name
-        rows = _run_async(_hf_search("name", q, limit))
-        if rows:
-            all_rows.extend(rows); searched.append("name")
+    if 8 <= len(q) <= 13:
+        try:
+            results = _run_async(search_in_parquet("phoneNumber", q, limit))
+            if results:
+                all_rows.extend(results)
+                searched.append("phoneNumber")
+        except Exception as e:
+            print(f"Phone search error: {e}")
+
+    if len(q) == 12:
+        try:
+            results = _run_async(search_in_parquet("aadharNumber", q, limit))
+            if results:
+                all_rows.extend(results)
+                searched.append("aadharNumber")
+        except Exception as e:
+            print(f"Aadhar search error: {e}")
+
+    if not all_rows:
+        try:
+            results = _run_async(search_in_parquet("otherNumber", q, limit))
+            if results:
+                all_rows.extend(results)
+                searched.append("otherNumber")
+        except Exception as e:
+            print(f"otherNumber search error: {e}")
 
     all_rows = _cap_duplicates(all_rows)[:limit]
+
     return {
         "query": q,
         "searched_fields": searched,
@@ -163,9 +203,9 @@ def _run_field_search_sync(field: str, value: str, mode: str, limit: int) -> dic
     if field not in SEARCH_FIELDS:
         return {"field": field, "value": value, "mode": mode, "count": 0, "results": [], "error": "Unknown field"}
     try:
-        rows = _run_async(_hf_search(field, value, limit))
-        rows = _cap_duplicates(rows)[:limit]
-        return {"field": field, "value": value, "mode": mode, "count": len(rows), "results": rows}
+        results = _run_async(search_in_parquet(field, value, limit))
+        results = _cap_duplicates(results)[:limit]
+        return {"field": field, "value": value, "mode": mode, "count": len(results), "results": results}
     except Exception as e:
         return {"field": field, "value": value, "mode": mode, "count": 0, "results": [], "error": str(e)}
 
@@ -186,14 +226,9 @@ async def pinger():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("🚀 ICMR Search API started!")
-    # Verify HF dataset is reachable
     try:
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            r = await client.get(f"{HF_API_BASE}/splits", params={"dataset": HF_DATASET})
-            if r.status_code == 200:
-                print(f"✅ HF dataset reachable: {HF_DATASET}")
-            else:
-                print(f"⚠️ HF /splits returned {r.status_code}")
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+            await discover_parquet_files(client)
     except Exception as e:
         print(f"Pre-warm failed: {e}")
     asyncio.create_task(pinger())
@@ -222,8 +257,15 @@ def health():
     return {
         "status": "ok",
         "dataset": HF_DATASET,
-        "method": "huggingface-dataset-viewer-api",
+        "discovered_files": {k: len(v) for k, v in _parquet_cache.items()},
+        "method": "duckdb-http-range",
     }
+
+@fastapi_app.get("/debug/files")
+async def debug_files():
+    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+        files = await discover_parquet_files(client)
+    return files
 
 @fastapi_app.get("/search")
 async def search(
@@ -339,9 +381,8 @@ def build_ui():
 - `GET /search/phone/<number>` — Phone search
 - `GET /search/aadhar/<number>` — Aadhar search
 - `GET /health` — Health check
+- `GET /debug/files` — Discovered files
 - `GET /docs` — Swagger UI
-
-**Note:** Uses Hugging Face Dataset Viewer API — no 227GB download, results aate hain server-side se.
             """)
         gr.Markdown("---\n<div style='text-align:center;color:#888;'>👨‍💻 **Developer:** @kzr0x | 📢 **Channel:** @api_wallah</div>")
     return demo
